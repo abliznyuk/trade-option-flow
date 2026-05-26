@@ -1,0 +1,14 @@
+{
+  "name": "trade-option-flow",
+  "version": "0.1.0",
+  "description": "Options order-flow visualizer: ATM ±10 strikes grid with bid/ask + trade bubbles for each contract.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

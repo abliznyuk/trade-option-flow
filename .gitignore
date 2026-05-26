@@ -1,0 +1,14 @@
+logs/
+data/
+out/
+dist/
+/config/
+node_modules/
+.env
+*-lock.json
+*.log
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db

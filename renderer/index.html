@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>option-flow</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="toolbar">
+    <label>Files dir
+      <input id="files-dir" type="text" placeholder="C:\Users\...\MQL5\Files" size="60" />
+    </label>
+    <button id="connect-btn">Connect</button>
+    <span class="sep"></span>
+    <label>Root <input id="root" type="text" value="SPY" size="6" /></label>
+    <label>Expiry <select id="expiry"><option value="">— pick after Connect —</option></select></label>
+    <label>Underlying <input id="underlying" type="text" value="SPY" size="8" placeholder="e.g. SPY" /></label>
+    <label>Strikes ± <input id="strikes-side" type="number" value="5" min="1" max="30" size="3" /></label>
+    <label>Window <input id="window-min" type="number" value="5" min="1" max="60" size="3" /> min</label>
+    <button id="go-btn" disabled>Go</button>
+    <span class="sep"></span>
+    <span id="status">disconnected</span>
+    <span class="sep"></span>
+    <span id="atm-display">ATM: —</span>
+  </header>
+
+  <main id="grid"></main>
+
+  <footer id="messages"></footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
