@@ -2,6 +2,7 @@ logs/
 data/
 out/
 dist/
+recordings/
 /config/
 node_modules/
 .env

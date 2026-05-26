@@ -7,10 +7,7 @@
 </head>
 <body>
   <header id="toolbar">
-    <label>Files dir
-      <input id="files-dir" type="text" placeholder="C:\Users\...\MQL5\Files" size="60" />
-    </label>
-    <button id="connect-btn">Connect</button>
+    <button id="mql-btn">MQL Files…</button>
     <span class="sep"></span>
     <label>Root <input id="root" type="text" value="SPY" size="6" /></label>
     <label>Expiry <select id="expiry"><option value="">— pick after Connect —</option></select></label>
@@ -22,11 +19,34 @@
     <span id="status">disconnected</span>
     <span class="sep"></span>
     <span id="atm-display">ATM: —</span>
+    <span class="tab-spacer"></span>
+    <span id="totals-since" class="tab-meta"></span>
+    <div class="toggle" id="totals-mode-toggle" hidden>
+      <button class="mode active" data-mode="premium">$</button>
+      <button class="mode"        data-mode="contracts">vol</button>
+    </div>
+    <div class="toggle" role="tablist">
+      <button class="tab active" data-tab="grid" role="tab">Grid</button>
+      <button class="tab"        data-tab="totals" role="tab">Totals</button>
+    </div>
   </header>
 
-  <main id="grid"></main>
+  <main id="grid" class="pane"></main>
+  <section id="totals" class="pane" hidden></section>
 
   <footer id="messages"></footer>
+
+  <div id="modal" class="modal-overlay" hidden>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h3 id="modal-title">MT5 Files directory</h3>
+      <p class="hint">Path to your MetaTrader 5 terminal's <code>MQL5\Files</code> folder. The DWX EA must be running in MT5 with Algo Trading enabled.</p>
+      <input id="files-dir" type="text" placeholder="C:\Users\...\AppData\Roaming\MetaQuotes\Terminal\&lt;HASH&gt;\MQL5\Files" />
+      <div class="modal-actions">
+        <button id="modal-cancel" class="ghost">Cancel</button>
+        <button id="connect-btn">Connect</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

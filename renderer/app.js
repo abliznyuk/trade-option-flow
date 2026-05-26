@@ -15,13 +15,34 @@ const state = {
   symbols: {},         // strike -> { call: 'SYM', put: 'SYM' }
   buffers: new Map(),  // symbol -> ring buffer of ticks
   charts: new Map(),   // symbol -> { canvas, ctx, cell }
+  // dynamic ATM tracking
+  centerStrike: null,  // closest strike at last rebuild
+  lastRebuildAt: 0,    // ms, wall-clock; cooldown for re-pick
+  rebuilding: false,
+  // session totals — accumulated from first tick onward, survives ATM-shift
+  // rebuilds and contract resubscriptions. Both metrics tracked simultaneously,
+  // mode toggle just changes the display.
+  // strike -> { call: {buy:{premium,contracts}, sell:{premium,contracts}},
+  //             put:  {buy:{...},               sell:{...}} }
+  totals: new Map(),
+  totalsStartedAt: null,
+  totalsMode: 'premium',  // 'premium' = $ paid, 'contracts' = # contracts
+  symbolMeta: new Map(), // symbol -> { strike, side: 'call'|'put' }
+  totalsRows: new Map(), // strike -> { callCell, putCell, strikeCell }
+  activeTab: 'grid',
 };
+
+const REBUILD_COOLDOWN_MS = 5000; // min time between ATM-driven regrids
+const CONTRACT_MULTIPLIER = 100;  // US equity options: 1 contract = 100 shares
 
 // ---- DOM -------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const els = {
   filesDir: $('files-dir'),
   connect:  $('connect-btn'),
+  mqlBtn:   $('mql-btn'),
+  modal:    $('modal'),
+  modalCancel: $('modal-cancel'),
   root:     $('root'),
   expiry:   $('expiry'),
   underlying: $('underlying'),
@@ -31,8 +52,61 @@ const els = {
   status:   $('status'),
   atmDisplay: $('atm-display'),
   grid:     $('grid'),
+  totals:   $('totals'),
+  totalsSince: $('totals-since'),
+  totalsModeToggle: $('totals-mode-toggle'),
   messages: $('messages'),
 };
+
+// ---- modal -----------------------------------------------------------------
+function openModal() {
+  els.modal.hidden = false;
+  // focus the input on next frame so the modal is rendered
+  requestAnimationFrame(() => els.filesDir.focus());
+}
+function closeModal() { els.modal.hidden = true; }
+
+els.mqlBtn.addEventListener('click', openModal);
+els.modalCancel.addEventListener('click', closeModal);
+
+// dismiss on backdrop click (clicks on the panel itself bubble but are not the overlay)
+els.modal.addEventListener('click', (e) => {
+  if (e.target === els.modal) closeModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !els.modal.hidden) closeModal();
+});
+// Enter inside the input = Connect
+els.filesDir.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.connect.click();
+});
+
+function setFilesDirDisplay(dir) {
+  els.mqlBtn.classList.toggle('connected', !!dir && state.connected);
+  els.mqlBtn.textContent = dir ? 'MQL Files ✓' : 'MQL Files…';
+  els.mqlBtn.title = dir || '';   // full path visible on hover
+}
+
+// ---- tabs ------------------------------------------------------------------
+document.querySelectorAll('.toggle .tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    state.activeTab = tab;
+    document.querySelectorAll('.toggle .tab').forEach(b => b.classList.toggle('active', b === btn));
+    els.grid.hidden   = tab !== 'grid';
+    els.totals.hidden = tab !== 'totals';
+    els.totalsModeToggle.hidden = tab !== 'totals';
+  });
+});
+
+// ---- totals mode (premium / contracts) -------------------------------------
+document.querySelectorAll('#totals-mode-toggle .mode').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.totalsMode = btn.dataset.mode;
+    document.querySelectorAll('#totals-mode-toggle .mode').forEach(b => b.classList.toggle('active', b === btn));
+    renderTotals();
+  });
+});
 
 function setStatus(text, cls) {
   els.status.textContent = text;
@@ -55,6 +129,8 @@ els.connect.addEventListener('click', async () => {
     await window.mt5.connect(dir);
     state.connected = true;
     setStatus('connected', 'connected');
+    setFilesDirDisplay(dir);
+    closeModal();
     await loadExpiries();
   } catch (e) {
     setStatus('error', 'error');
@@ -65,6 +141,14 @@ els.connect.addEventListener('click', async () => {
 window.mt5.onAutoFilesDir(async (dir) => {
   els.filesDir.value = dir;
   els.connect.click();
+});
+
+// Open the modal automatically on first launch if no path was pre-filled
+// from the command line / env (mt5:auto-files-dir fires shortly after load).
+window.addEventListener('DOMContentLoaded', () => {
+  setTimeout(() => {
+    if (!state.connected && !els.filesDir.value.trim()) openModal();
+  }, 150);
 });
 
 window.mt5.onMessage((msg) => {
@@ -113,7 +197,24 @@ window.mt5.onQuote(({ symbol, bid, ask }) => {
   if (!Number.isFinite(mid) || mid <= 0) return;
   state.atm = mid;
   els.atmDisplay.textContent = `ATM: ${mid.toFixed(2)}`;
+  maybeReshiftATM();
 });
+
+// Re-pick strikes around the new ATM when the closest strike has shifted.
+// Cooldown prevents thrash on jittery underlyings. Buffers for surviving
+// contracts are preserved across the rebuild.
+function maybeReshiftATM() {
+  if (!state.strikes.length || state.rebuilding) return;
+  if (Date.now() - state.lastRebuildAt < REBUILD_COOLDOWN_MS) return;
+  const newCenter = closestStrike(state.strikes, state.atm);
+  if (newCenter === state.centerStrike) return;
+  // shifted — pull a fresh window from the full chain
+  rebuildGrid().catch(e => logMsg(`ATM reshift failed: ${e.message}`, 'err'));
+}
+
+function closestStrike(arr, target) {
+  return arr.reduce((b, s) => Math.abs(s - target) < Math.abs(b - target) ? s : b, arr[0]);
+}
 
 // ---- Go: build the grid ----------------------------------------------------
 els.go.addEventListener('click', async () => {
@@ -152,24 +253,52 @@ function waitForATM(timeoutMs) {
 }
 
 async function rebuildGrid() {
-  const allStrikes = state.chain.byExpiry[state.expiry].strikes;
-  const side = Math.max(1, parseInt(els.strikesSide.value, 10) || 5);
-  const strikes = await window.mt5.pickStrikes({ strikes: allStrikes, atm: state.atm, side });
-  state.strikes = strikes;
-  state.symbols = {};
-  for (const s of strikes) {
-    state.symbols[s] = state.chain.byExpiry[state.expiry].byStrike[s];
-  }
+  state.rebuilding = true;
+  try {
+    const allStrikes = state.chain.byExpiry[state.expiry].strikes;
+    const side = Math.max(1, parseInt(els.strikesSide.value, 10) || 5);
+    const strikes = await window.mt5.pickStrikes({ strikes: allStrikes, atm: state.atm, side });
+    state.strikes = strikes;
+    state.symbols = {};
+    const newSymSet = new Set();
+    for (const s of strikes) {
+      const pair = state.chain.byExpiry[state.expiry].byStrike[s] || {};
+      state.symbols[s] = pair;
+      if (pair.call) {
+        newSymSet.add(pair.call);
+        state.symbolMeta.set(pair.call, { strike: s, side: 'call' });
+      }
+      if (pair.put) {
+        newSymSet.add(pair.put);
+        state.symbolMeta.set(pair.put, { strike: s, side: 'put' });
+      }
+    }
+    // preserve buffers for symbols still in the visible window
+    for (const sym of [...state.buffers.keys()]) {
+      if (!newSymSet.has(sym)) state.buffers.delete(sym);
+    }
+    for (const sym of newSymSet) {
+      if (!state.buffers.has(sym)) state.buffers.set(sym, []);
+    }
 
-  buildGridDOM();
-  await subscribeAllTicks();
-  startRenderLoop();
+    state.centerStrike = closestStrike(strikes, state.atm);
+    state.lastRebuildAt = Date.now();
+    if (state.totalsStartedAt == null) {
+      state.totalsStartedAt = Date.now();
+    }
+
+    buildGridDOM();
+    buildTotalsDOM();
+    await subscribeAllTicks();
+    startRenderLoop();
+  } finally {
+    state.rebuilding = false;
+  }
 }
 
 function buildGridDOM() {
   els.grid.innerHTML = '';
-  state.buffers.clear();
-  state.charts.clear();
+  state.charts.clear();  // canvases re-created below; buffers are preserved
 
   // strikes descending (highest at top, lowest at bottom — standard ladder layout)
   const ordered = [...state.strikes].sort((a, b) => b - a);
@@ -206,7 +335,7 @@ function makeChartCell(side, symbol, strike) {
     lbl.textContent = symbol;
     cell.appendChild(lbl);
     state.charts.set(symbol, { canvas, ctx: canvas.getContext('2d'), cell, side });
-    state.buffers.set(symbol, []);
+    if (!state.buffers.has(symbol)) state.buffers.set(symbol, []);
   } else {
     cell.style.opacity = '0.3';
   }
@@ -236,17 +365,127 @@ async function subscribeAllTicks() {
 // ---- tick ingestion --------------------------------------------------------
 window.mt5.onTicks(({ symbol, ticks }) => {
   const buf = state.buffers.get(symbol);
-  if (!buf) return;
-  for (const t of ticks) buf.push(t);
+  const meta = state.symbolMeta.get(symbol);
+  for (const t of ticks) {
+    if (buf) buf.push(t);
+    // session totals: accumulate $ premium per (strike, side, direction).
+    // Premium = price × volume × 100 (US equity options contract multiplier).
+    // Only flagged buy/sell trades count — neutral ticks are ignored.
+    if (meta && t.is_trade && (t.is_buy || t.is_sell) && t.p > 0 && t.v > 0) {
+      let tot = state.totals.get(meta.strike);
+      if (!tot) {
+        tot = {
+          call: { buy: { premium: 0, contracts: 0 }, sell: { premium: 0, contracts: 0 } },
+          put:  { buy: { premium: 0, contracts: 0 }, sell: { premium: 0, contracts: 0 } },
+        };
+        state.totals.set(meta.strike, tot);
+      }
+      const premium = t.p * t.v * CONTRACT_MULTIPLIER;
+      const bin = tot[meta.side][t.is_buy ? 'buy' : 'sell'];
+      bin.premium   += premium;
+      bin.contracts += t.v;
+    }
+  }
   // hard cap by count to avoid unbounded growth — time-window trim happens at render
   // time using the global "tick clock" (max t across buffers), so we don't depend
   // on Date.now() vs broker-server-time offset.
-  const MAX_PER_SYMBOL = 6000;
-  if (buf.length > MAX_PER_SYMBOL) buf.splice(0, buf.length - MAX_PER_SYMBOL);
+  if (buf) {
+    const MAX_PER_SYMBOL = 6000;
+    if (buf.length > MAX_PER_SYMBOL) buf.splice(0, buf.length - MAX_PER_SYMBOL);
+  }
 });
+
+// ---- totals pane -----------------------------------------------------------
+function buildTotalsDOM() {
+  els.totals.innerHTML = '';
+  state.totalsRows.clear();
+  const ordered = [...state.strikes].sort((a, b) => b - a);
+  const nearest = closestStrike(ordered, state.atm);
+  for (const strike of ordered) {
+    const callCell = document.createElement('div');
+    callCell.className = 'tcell call';
+    callCell.innerHTML = '<div class="bars"><div class="bar-row"><div class="bar-track"><div class="bar buy"></div></div><span class="bar-label"></span></div><div class="bar-row"><div class="bar-track"><div class="bar sell"></div></div><span class="bar-label"></span></div></div>';
+
+    const strikeCell = document.createElement('div');
+    strikeCell.className = 'tcell strike' + (strike === nearest ? ' atm' : '');
+    strikeCell.textContent = formatStrike(strike);
+
+    const putCell = document.createElement('div');
+    putCell.className = 'tcell put';
+    putCell.innerHTML = '<div class="bars"><div class="bar-row"><div class="bar-track"><div class="bar buy"></div></div><span class="bar-label"></span></div><div class="bar-row"><div class="bar-track"><div class="bar sell"></div></div><span class="bar-label"></span></div></div>';
+
+    els.totals.appendChild(callCell);
+    els.totals.appendChild(strikeCell);
+    els.totals.appendChild(putCell);
+    state.totalsRows.set(strike, { callCell, putCell, strikeCell });
+  }
+}
+
+function fmtMoney(v) {
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(v >= 1e7 ? 1 : 2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(v >= 1e4 ? 0 : 1)}k`;
+  if (v > 0)    return `$${v.toFixed(0)}`;
+  return '$0';
+}
+
+function fmtContracts(v) {
+  if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(v >= 1e4 ? 0 : 1)}k`;
+  return v > 0 ? String(Math.round(v)) : '0';
+}
+
+const EMPTY_BIN = { premium: 0, contracts: 0 };
+const EMPTY_SIDE = { buy: EMPTY_BIN, sell: EMPTY_BIN };
+
+function renderTotals() {
+  if (!state.totalsRows.size) return;
+  const key = state.totalsMode === 'contracts' ? 'contracts' : 'premium';
+  const fmt = key === 'contracts' ? fmtContracts : fmtMoney;
+
+  // global max for shared scale (so cross-strike comparison is honest)
+  let maxV = 0;
+  for (const tot of state.totals.values()) {
+    if (tot.call.buy[key]  > maxV) maxV = tot.call.buy[key];
+    if (tot.call.sell[key] > maxV) maxV = tot.call.sell[key];
+    if (tot.put.buy[key]   > maxV) maxV = tot.put.buy[key];
+    if (tot.put.sell[key]  > maxV) maxV = tot.put.sell[key];
+  }
+  if (maxV === 0) maxV = 1;
+
+  for (const [strike, row] of state.totalsRows) {
+    const tot = state.totals.get(strike) || { call: EMPTY_SIDE, put: EMPTY_SIDE };
+    updateBarRow(row.callCell, tot.call, maxV, key, fmt);
+    updateBarRow(row.putCell,  tot.put,  maxV, key, fmt);
+  }
+
+  if (state.totalsStartedAt) {
+    const sec = Math.floor((Date.now() - state.totalsStartedAt) / 1000);
+    const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+    const ss = String(sec % 60).padStart(2, '0');
+    els.totalsSince.textContent = `since session start · ${mm}:${ss}`;
+  }
+}
+
+function updateBarRow(cell, side, maxV, key, fmt) {
+  const rows = cell.querySelectorAll('.bar-row');
+  // rows[0] = buy (blue), rows[1] = sell (pink)
+  const buyBar  = rows[0].querySelector('.bar');
+  const buyLbl  = rows[0].querySelector('.bar-label');
+  const sellBar = rows[1].querySelector('.bar');
+  const sellLbl = rows[1].querySelector('.bar-label');
+  const buyV  = side.buy[key];
+  const sellV = side.sell[key];
+  const buyPct  = (buyV  / maxV) * 100;
+  const sellPct = (sellV / maxV) * 100;
+  buyBar.style.width  = `${Math.max(buyPct,  buyV  > 0 ? 0.5 : 0)}%`;
+  sellBar.style.width = `${Math.max(sellPct, sellV > 0 ? 0.5 : 0)}%`;
+  buyLbl.textContent  = fmt(buyV);
+  sellLbl.textContent = fmt(sellV);
+}
 
 // ---- render loop -----------------------------------------------------------
 let rafHandle = null;
+let lastTotalsRenderAt = 0;
 function startRenderLoop() {
   if (rafHandle != null) return;
   const loop = () => {
@@ -261,7 +500,16 @@ function startRenderLoop() {
       }
     }
     if (tickNow === 0) tickNow = Date.now();
-    for (const [sym, chart] of state.charts) renderChart(sym, chart, tickNow);
+    // grid: render only when visible (canvas redraws are expensive)
+    if (state.activeTab === 'grid') {
+      for (const [sym, chart] of state.charts) renderChart(sym, chart, tickNow);
+    }
+    // totals: DOM bars, throttle to ~4 Hz, render always so timer keeps ticking
+    const now = Date.now();
+    if (now - lastTotalsRenderAt >= 250) {
+      lastTotalsRenderAt = now;
+      renderTotals();
+    }
     rafHandle = requestAnimationFrame(loop);
   };
   rafHandle = requestAnimationFrame(loop);

@@ -35,20 +35,116 @@ const { buildChain, pickStrikesAroundATM } = require('./lib/occ');
 let win = null;
 let client = null;
 
+// --- cli --------------------------------------------------------------------
+const ARGV = process.argv.slice(2);
+function argVal(name) {
+  const hit = ARGV.find(a => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : null;
+}
+function argFlag(name) {
+  return ARGV.includes(`--${name}`);
+}
+
 // --- config -----------------------------------------------------------------
 // User can override via cli arg --files-dir=... or env MT5_FILES_DIR.
 function resolveFilesDir() {
-  const argv = process.argv.slice(2);
-  for (const a of argv) {
-    if (a.startsWith('--files-dir=')) return a.slice('--files-dir='.length);
-  }
+  const v = argVal('files-dir');
+  if (v) return v;
   if (process.env.MT5_FILES_DIR) return process.env.MT5_FILES_DIR;
   return null; // will be set via settings UI in renderer
+}
+
+// --- record / replay --------------------------------------------------------
+// Record mode: `npm start -- --record` (auto path under ./recordings) or
+// `--record=/some/path.jsonl`. Captures every event we send to the renderer,
+// plus the result of get-symbols / build-chain so chains can be rebuilt on
+// replay. Output is JSONL, one JSON object per line:
+//   {kind:"meta", startedAt, version}
+//   {t:<ms>, kind:"event", ch, p}
+//   {t:<ms>, kind:"rpc",   name, args, result}
+//
+// Replay mode: `npm start -- --replay=path [--replay-speed=N]`. Skips DWX,
+// schedules every event from the file via setTimeout relative to the moment
+// the renderer calls mt5:connect. get-symbols / build-chain serve recorded
+// results in FIFO order. Subscribe calls become no-ops.
+const recordPathArg = (() => {
+  const v = argVal('record');
+  if (v) return v;
+  if (argFlag('record')) {
+    const dir = path.join(__dirname, 'recordings');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    return path.join(dir, `flow-${stamp}.jsonl`);
+  }
+  return null;
+})();
+const replayPath = argVal('replay');
+const replaySpeed = Math.max(0.01, parseFloat(argVal('replay-speed') || '1') || 1);
+
+let recStream = null;
+let recStart = 0;
+if (recordPathArg && !replayPath) {
+  fs.mkdirSync(path.dirname(recordPathArg), { recursive: true });
+  recStream = fs.createWriteStream(recordPathArg, { flags: 'a' });
+  recStart = Date.now();
+  recStream.write(JSON.stringify({ kind: 'meta', startedAt: recStart, version: 1 }) + '\n');
+  console.log('[record] →', recordPathArg);
+}
+function recordEvent(ch, payload) {
+  if (!recStream) return;
+  recStream.write(JSON.stringify({ t: Date.now() - recStart, kind: 'event', ch, p: payload }) + '\n');
+}
+function recordRpc(name, args, result) {
+  if (!recStream) return;
+  recStream.write(JSON.stringify({ t: Date.now() - recStart, kind: 'rpc', name, args, result }) + '\n');
+}
+
+let replay = null;
+function loadReplay() {
+  const raw = fs.readFileSync(replayPath, 'utf8').split('\n').filter(Boolean);
+  const entries = [];
+  for (const ln of raw) { try { entries.push(JSON.parse(ln)); } catch {} }
+  const events = entries.filter(e => e.kind === 'event');
+  const rpcQ = new Map();
+  for (const e of entries) {
+    if (e.kind !== 'rpc') continue;
+    if (!rpcQ.has(e.name)) rpcQ.set(e.name, []);
+    rpcQ.get(e.name).push(e.result);
+  }
+  console.log(`[replay] ${entries.length} entries (${events.length} events), speed ×${replaySpeed} ←`, replayPath);
+  return {
+    events,
+    popRpc(name) {
+      const arr = rpcQ.get(name);
+      return arr && arr.length ? arr.shift() : null;
+    },
+    peekRpc(name) {
+      const arr = rpcQ.get(name);
+      return arr && arr.length ? arr[0] : null;
+    },
+  };
+}
+function startReplayStream() {
+  if (!replay) return;
+  const t0 = Date.now();
+  for (const e of replay.events) {
+    const due = e.t / replaySpeed;
+    setTimeout(() => {
+      if (win && !win.isDestroyed()) win.webContents.send(e.ch, e.p);
+    }, due);
+  }
+  const last = replay.events.length ? replay.events[replay.events.length - 1].t : 0;
+  console.log(`[replay] scheduled, total span ${(last / 1000).toFixed(1)}s wall → ${(last / replaySpeed / 1000).toFixed(1)}s playback`);
 }
 
 // --- IPC --------------------------------------------------------------------
 function setupIpc() {
   ipcMain.handle('mt5:connect', async (_evt, filesDir) => {
+    if (replay) {
+      // Replay mode: skip DWX, schedule recorded events relative to now.
+      startReplayStream();
+      return { ok: true, replay: true };
+    }
     if (!filesDir || !fs.existsSync(filesDir)) {
       throw new Error(`files dir not found: ${filesDir}`);
     }
@@ -71,30 +167,47 @@ function setupIpc() {
   });
 
   ipcMain.handle('mt5:get-symbols', async (_evt, filter) => {
+    if (replay) {
+      const r = replay.popRpc('get-symbols') || replay.peekRpc('build-chain');
+      if (!r) throw new Error('replay: no recorded get-symbols result');
+      return r;
+    }
     if (!client) throw new Error('not connected');
     // Brokers with a huge symbol catalogue (full options chains) can take
     // a long time on the first call as the terminal lazy-loads them.
     const data = await client.get_symbols(filter || '', 60_000);
+    recordRpc('get-symbols', [filter], data);
     return data;
   });
 
   ipcMain.handle('mt5:build-chain', async (_evt, { rootFilter, expiry }) => {
+    if (replay) {
+      const r = replay.popRpc('build-chain');
+      if (r) return r;
+      // fall back: rebuild from a recorded get-symbols payload
+      const sy = replay.peekRpc('get-symbols');
+      if (sy) return buildChain(sy.symbols);
+      throw new Error('replay: no recorded chain');
+    }
     if (!client) throw new Error('not connected');
     const filter = expiry
       ? `${rootFilter}` // we filter further on the JS side after parsing
       : rootFilter;
     const data = await client.get_symbols(filter || '', 60_000);
     const chain = buildChain(data.symbols);
+    recordRpc('build-chain', [{ rootFilter, expiry }], chain);
     return chain;
   });
 
   ipcMain.handle('mt5:subscribe-quote', async (_evt, symbol) => {
+    if (replay) return { ok: true };
     if (!client) throw new Error('not connected');
     await client.subscribe_symbols([symbol]); // single symbol for ATM tracking
     return { ok: true };
   });
 
   ipcMain.handle('mt5:subscribe-ticks', async (_evt, specs) => {
+    if (replay) return { ok: true };
     if (!client) throw new Error('not connected');
     // specs: [{symbol, lookback_sec}, ...]
     await client.subscribe_ticks(specs);
@@ -102,6 +215,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('mt5:unsubscribe-ticks-all', async () => {
+    if (replay) return { ok: true };
     if (!client) return { ok: true };
     await client.subscribe_ticks([]);
     return { ok: true };
@@ -113,6 +227,7 @@ function setupIpc() {
 }
 
 function send(channel, payload) {
+  recordEvent(channel, payload);
   if (win && !win.isDestroyed()) {
     win.webContents.send(channel, payload);
   }
@@ -146,8 +261,15 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (replayPath) replay = loadReplay();
   setupIpc();
   createWindow();
+  // In replay mode there's no real files dir — auto-trigger connect so the
+  // renderer doesn't sit waiting for the user to fill the input.
+  if (replay) {
+    const tryAuto = () => win && win.webContents.send('mt5:auto-files-dir', '__REPLAY__');
+    if (win) win.webContents.once('did-finish-load', tryAuto);
+  }
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -155,5 +277,6 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   try { client && (client.ACTIVE = false); } catch {}
+  try { recStream && recStream.end(); } catch {}
   if (process.platform !== 'darwin') app.quit();
 });

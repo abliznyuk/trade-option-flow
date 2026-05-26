@@ -66,6 +66,32 @@ MT5_FILES_DIR="..." npm start
 6. **Window** is the rolling time window per cell in minutes.
 7. **Go** → contracts start streaming.
 
+## Record & replay (debug visualisation without MT5)
+
+Most option brokers don't expose historical option ticks via `CopyTicks`, so
+there's no "give me yesterday's flow" button. The app instead records a live
+session to a file you can replay offline as many times as you want.
+
+Record a session:
+
+```bash
+npm start -- --record                              # auto path: ./recordings/flow-<ts>.jsonl
+npm start -- --record=./recordings/my-spy-0dte.jsonl
+```
+
+Every event sent to the renderer (`mt5:quote`, `mt5:ticks`, `mt5:message`)
+plus the `get-symbols` / `build-chain` results are appended as JSONL.
+
+Replay (MT5 not required — DWX is bypassed):
+
+```bash
+npm start -- --replay=./recordings/my-spy-0dte.jsonl
+npm start -- --replay=./recordings/my-spy-0dte.jsonl --replay-speed=10
+```
+
+Speed `1` = real time, `10` = 10× faster, `0.5` = slow-mo. The renderer is
+unaware it's a recording — same code path, same visuals.
+
 ## What you see
 
 Layout: **calls left | strike middle | puts right**, highest strike on top.
