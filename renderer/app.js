@@ -30,10 +30,25 @@ const state = {
   symbolMeta: new Map(), // symbol -> { strike, side: 'call'|'put' }
   totalsRows: new Map(), // strike -> { callCell, putCell, strikeCell }
   activeTab: 'grid',
+  // multi-leg / block prints
+  blockBuffer: [],        // recent trades fed into the detector: {id,t,symbol,strike,side,p,v,isBuy,isSell,consumed}
+  blocks: [],             // detected blocks, newest first, capped
+  blockHighlights: new Map(), // symbol -> [{tickT, expireAt, kind}]
+  blocksSeenAt: 0,        // when user last viewed Blocks tab — used to drive "has-new" badge
 };
 
 const REBUILD_COOLDOWN_MS = 5000; // min time between ATM-driven regrids
 const CONTRACT_MULTIPLIER = 100;  // US equity options: 1 contract = 100 shares
+
+// ---- block detector tunables ----------------------------------------------
+const BLOCK_WINDOW_MS    = 50;   // trades within this span (broker server time) cluster together
+const BLOCK_DEBOUNCE_MS  = 80;   // wait this long after last trade before classifying
+const BLOCK_MIN_PREMIUM  = 5000; // ignore groups under $5k total premium (retail noise)
+const BLOCK_VOL_TOL      = 0.05; // ±5% volume equality for "same size" legs
+const BLOCK_HIGHLIGHT_MS = 30000; // how long a leg stays ringed in the grid
+const BLOCK_MAX_KEEP     = 500;  // cap on stored blocks
+let blockNextId = 0;
+let blockFlushTimer = null;
 
 // ---- DOM -------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -53,8 +68,12 @@ const els = {
   atmDisplay: $('atm-display'),
   grid:     $('grid'),
   totals:   $('totals'),
-  totalsSince: $('totals-since'),
   totalsModeToggle: $('totals-mode-toggle'),
+  blocks:      $('blocks'),
+  blocksList:  $('blocks-list'),
+  blocksEmpty: $('blocks-empty'),
+  blocksCount: $('blocks-count'),
+  blocksTab:   null, // set below
   messages: $('messages'),
 };
 
@@ -89,13 +108,19 @@ function setFilesDirDisplay(dir) {
 
 // ---- tabs ------------------------------------------------------------------
 document.querySelectorAll('.toggle .tab').forEach(btn => {
+  if (btn.dataset.tab === 'blocks') els.blocksTab = btn;
   btn.addEventListener('click', () => {
     const tab = btn.dataset.tab;
     state.activeTab = tab;
     document.querySelectorAll('.toggle .tab').forEach(b => b.classList.toggle('active', b === btn));
-    els.grid.hidden   = tab !== 'grid';
-    els.totals.hidden = tab !== 'totals';
+    els.grid.hidden    = tab !== 'grid';
+    els.totals.hidden  = tab !== 'totals';
+    els.blocks.hidden  = tab !== 'blocks';
     els.totalsModeToggle.hidden = tab !== 'totals';
+    if (tab === 'blocks') {
+      state.blocksSeenAt = state.blocks.length;
+      els.blocksTab.classList.remove('has-new');
+    }
   });
 });
 
@@ -384,6 +409,21 @@ window.mt5.onTicks(({ symbol, ticks }) => {
       const bin = tot[meta.side][t.is_buy ? 'buy' : 'sell'];
       bin.premium   += premium;
       bin.contracts += t.v;
+
+      // feed block detector
+      state.blockBuffer.push({
+        id: ++blockNextId,
+        t: t.t,
+        symbol,
+        strike: meta.strike,
+        side: meta.side,
+        p: t.p,
+        v: t.v,
+        isBuy: t.is_buy,
+        isSell: t.is_sell,
+        consumed: false,
+      });
+      scheduleBlockFlush();
     }
   }
   // hard cap by count to avoid unbounded growth — time-window trim happens at render
@@ -394,6 +434,208 @@ window.mt5.onTicks(({ symbol, ticks }) => {
     if (buf.length > MAX_PER_SYMBOL) buf.splice(0, buf.length - MAX_PER_SYMBOL);
   }
 });
+
+// ---- block detector --------------------------------------------------------
+// Groups trades that arrived on different contracts within BLOCK_WINDOW_MS of
+// each other (broker server time, immune to wall-clock skew). Classifies each
+// group against the known multi-leg patterns. Emits at most one block per
+// group; consumed legs are tagged and won't fire again.
+function scheduleBlockFlush() {
+  if (blockFlushTimer != null) return;
+  blockFlushTimer = setTimeout(() => {
+    blockFlushTimer = null;
+    flushBlocks();
+  }, BLOCK_DEBOUNCE_MS);
+}
+
+function flushBlocks() {
+  if (!state.blockBuffer.length) return;
+  // newest tick time across the buffer — used as the "is the window for this
+  // group definitely closed?" reference.
+  let maxT = 0;
+  for (const e of state.blockBuffer) if (e.t > maxT) maxT = e.t;
+
+  // group unconsumed entries whose window is fully behind us
+  const ready = state.blockBuffer
+    .filter(e => !e.consumed && e.t + BLOCK_WINDOW_MS <= maxT)
+    .sort((a, b) => a.t - b.t);
+
+  // group within BLOCK_WINDOW_MS of the FIRST leg (not the previous one) so a
+  // group can't chain-walk across multiple windows.
+  const groups = [];
+  for (const e of ready) {
+    const last = groups.length && groups[groups.length - 1];
+    if (last && e.t - last[0].t <= BLOCK_WINDOW_MS) last.push(e);
+    else groups.push([e]);
+  }
+
+  for (const g of groups) {
+    if (g.length < 2) continue;
+    // skip groups that share a single symbol (same-contract sweep, not multi-leg)
+    const symbols = new Set(g.map(l => l.symbol));
+    if (symbols.size < 2) continue;
+    const block = classifyBlock(g);
+    if (!block) continue;
+    for (const leg of g) leg.consumed = true;
+    onBlockDetected(block, g);
+  }
+
+  // drop entries older than 5s from the newest seen tick
+  state.blockBuffer = state.blockBuffer.filter(e => maxT - e.t < 5000 && !e.consumed);
+
+  // if anything fresh still waits for its window to close, schedule another sweep
+  if (state.blockBuffer.length) scheduleBlockFlush();
+}
+
+function classifyBlock(legs) {
+  const totalPremium = legs.reduce((s, e) => s + e.p * e.v * CONTRACT_MULTIPLIER, 0);
+  if (totalPremium < BLOCK_MIN_PREMIUM) return null;
+
+  if (legs.length === 2) return classify2Leg(legs, totalPremium);
+  if (legs.length === 3) return classify3Leg(legs, totalPremium);
+  if (legs.length === 4) return classify4Leg(legs, totalPremium);
+  return null;
+}
+
+function classify2Leg(legs, premium) {
+  const [a, b] = legs;
+  if (!volsEqual(a.v, b.v)) return null;
+  const sameSide   = a.side === b.side;
+  const sameStrike = a.strike === b.strike;
+
+  if (sameSide && !sameStrike) {
+    return mk('VERTICAL', premium, a.v, {
+      side: a.side,
+      strikes: [a.strike, b.strike].sort((x, y) => x - y),
+    });
+  }
+  if (!sameSide && sameStrike) {
+    return mk('STRADDLE', premium, a.v, { strike: a.strike });
+  }
+  if (!sameSide && !sameStrike) {
+    const callLeg = a.side === 'call' ? a : b;
+    const putLeg  = a.side === 'put'  ? a : b;
+    // strangle: both legs same aggressor direction (both bought or both sold)
+    // risk reversal: legs in opposite directions
+    const sameDir = (a.isBuy && b.isBuy) || (a.isSell && b.isSell);
+    if (sameDir) {
+      return mk('STRANGLE', premium, a.v, {
+        call: callLeg.strike, put: putLeg.strike, dir: a.isBuy ? 'buy' : 'sell',
+      });
+    }
+    return mk('RISK_REVERSAL', premium, a.v, {
+      call: callLeg.strike, put: putLeg.strike,
+      longSide: callLeg.isBuy ? 'call' : 'put',
+    });
+  }
+  // (calendar would land here too — same side, same strike, different expiry —
+  //  but we don't carry expiry on the leg yet; one-expiry subscription means
+  //  it's not detectable in MVP anyway)
+  return null;
+}
+
+function classify3Leg(legs, premium) {
+  // butterfly: all same side, 3 strikes equally spaced, volumes 1:2:1
+  const side0 = legs[0].side;
+  if (!legs.every(l => l.side === side0)) return null;
+  const sorted = [...legs].sort((a, b) => a.strike - b.strike);
+  const [lo, mid, hi] = sorted;
+  if (!nearlyEqual(mid.strike - lo.strike, hi.strike - mid.strike)) return null;
+  if (!volsEqual(lo.v, hi.v)) return null;
+  if (!nearlyEqual(mid.v, 2 * lo.v, 2 * BLOCK_VOL_TOL)) return null;
+  return mk('BUTTERFLY', premium, lo.v, {
+    side: side0, strikes: [lo.strike, mid.strike, hi.strike],
+  });
+}
+
+function classify4Leg(legs, premium) {
+  // iron condor: 2 calls + 2 puts, all four legs same size
+  const calls = legs.filter(l => l.side === 'call');
+  const puts  = legs.filter(l => l.side === 'put');
+  if (calls.length !== 2 || puts.length !== 2) return null;
+  const v0 = legs[0].v;
+  if (!legs.every(l => volsEqual(l.v, v0))) return null;
+  return mk('IRON_CONDOR', premium, v0, {
+    callStrikes: calls.map(l => l.strike).sort((a, b) => a - b),
+    putStrikes:  puts.map(l => l.strike).sort((a, b) => a - b),
+  });
+}
+
+function mk(kind, premium, volume, extra) {
+  return { kind, premium, volume, ...extra };
+}
+function volsEqual(a, b) {
+  return Math.abs(a - b) / Math.max(a, b) <= BLOCK_VOL_TOL;
+}
+function nearlyEqual(a, b, tol = 0.01) {
+  return Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1e-9) <= tol;
+}
+
+function onBlockDetected(block, legs) {
+  block.id = ++blockNextId;
+  block.t  = legs[legs.length - 1].t;
+  block.legs = legs.map(l => ({
+    symbol: l.symbol, strike: l.strike, side: l.side, p: l.p, v: l.v,
+    isBuy: l.isBuy, isSell: l.isSell,
+  }));
+  state.blocks.unshift(block);
+  if (state.blocks.length > BLOCK_MAX_KEEP) state.blocks.length = BLOCK_MAX_KEEP;
+
+  // schedule highlight rings on the grid for each leg
+  const until = Date.now() + BLOCK_HIGHLIGHT_MS;
+  for (const leg of legs) {
+    let arr = state.blockHighlights.get(leg.symbol);
+    if (!arr) { arr = []; state.blockHighlights.set(leg.symbol, arr); }
+    arr.push({ tickT: leg.t, until, kind: block.kind });
+  }
+
+  els.blocksCount.textContent = String(state.blocks.length);
+  if (state.activeTab !== 'blocks') els.blocksTab.classList.add('has-new');
+  prependBlockRow(block);
+  logMsg(`block ${block.kind} ${formatBlockDesc(block)} ${fmtMoney(block.premium)}`, 'info');
+}
+
+// ---- blocks pane rendering -------------------------------------------------
+function prependBlockRow(block) {
+  els.blocksEmpty.hidden = true;
+  const row = document.createElement('div');
+  row.className = 'block ' + block.kind.toLowerCase().replace(/_/g, '-') + ' flash';
+  const ts = new Date(block.t).toLocaleTimeString('en-GB', { hour12: false }) +
+             '.' + String(block.t % 1000).padStart(3, '0');
+  row.innerHTML = `
+    <span class="ts">${ts}</span>
+    <span class="kind">${block.kind.replace(/_/g, ' ')}</span>
+    <span class="desc">${formatBlockDesc(block)}</span>
+    <span class="vol">×${block.volume}</span>
+    <span class="prem">${fmtMoney(block.premium)}</span>
+  `;
+  els.blocksList.prepend(row);
+  // keep the DOM bounded too
+  while (els.blocksList.childElementCount > BLOCK_MAX_KEEP) {
+    els.blocksList.removeChild(els.blocksList.lastChild);
+  }
+}
+
+function formatBlockDesc(b) {
+  const sideSym = (s) => s === 'call' ? 'C' : 'P';
+  switch (b.kind) {
+    case 'VERTICAL':
+      return `${sideSym(b.side)} ${b.strikes[0]}/${b.strikes[1]}`;
+    case 'STRADDLE':
+      return `${b.strike}`;
+    case 'STRANGLE':
+      return `P${b.put} / C${b.call}` + (b.dir ? ` (${b.dir})` : '');
+    case 'BUTTERFLY':
+      return `${sideSym(b.side)} ${b.strikes.join('/')}`;
+    case 'IRON_CONDOR':
+      return `P${b.putStrikes[0]}/${b.putStrikes[1]} – C${b.callStrikes[0]}/${b.callStrikes[1]}`;
+    case 'RISK_REVERSAL':
+      return `+${b.longSide === 'call' ? 'C' : 'P'}${b.longSide === 'call' ? b.call : b.put}` +
+             ` / -${b.longSide === 'call' ? 'P' : 'C'}${b.longSide === 'call' ? b.put : b.call}`;
+    default:
+      return '';
+  }
+}
 
 // ---- totals pane -----------------------------------------------------------
 function buildTotalsDOM() {
@@ -457,13 +699,6 @@ function renderTotals() {
     updateBarRow(row.callCell, tot.call, maxV, key, fmt);
     updateBarRow(row.putCell,  tot.put,  maxV, key, fmt);
   }
-
-  if (state.totalsStartedAt) {
-    const sec = Math.floor((Date.now() - state.totalsStartedAt) / 1000);
-    const mm = String(Math.floor(sec / 60)).padStart(2, '0');
-    const ss = String(sec % 60).padStart(2, '0');
-    els.totalsSince.textContent = `since session start · ${mm}:${ss}`;
-  }
 }
 
 function updateBarRow(cell, side, maxV, key, fmt) {
@@ -509,6 +744,7 @@ function startRenderLoop() {
     if (now - lastTotalsRenderAt >= 250) {
       lastTotalsRenderAt = now;
       renderTotals();
+      pruneBlockHighlights(now);
     }
     rafHandle = requestAnimationFrame(loop);
   };
@@ -583,6 +819,8 @@ function renderChart(symbol, { canvas, ctx, cell, side }, tickNow) {
   // --- trade bubbles ---
   const rMax = Math.min(12, h / 3);
   const rMin = 1.5;
+  const highlights = state.blockHighlights.get(symbol);
+  const now = Date.now();
   for (const t of buf) {
     if (t.t < tMin || t.t > tMax) continue;
     if (!t.is_trade) continue;
@@ -598,6 +836,29 @@ function renderChart(symbol, { canvas, ctx, cell, side }, tickNow) {
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.fill();
+
+    // multi-leg highlight ring: if this tick is part of a recently detected
+    // block, draw a yellow outline around the bubble that fades as the
+    // highlight window expires.
+    if (highlights) {
+      const hl = highlights.find(h => h.tickT === t.t && h.until > now);
+      if (hl) {
+        const remaining = (hl.until - now) / BLOCK_HIGHLIGHT_MS;
+        ctx.strokeStyle = `rgba(255, 211, 61, ${0.4 + 0.5 * remaining})`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+function pruneBlockHighlights(now) {
+  for (const [sym, arr] of state.blockHighlights) {
+    const kept = arr.filter(h => h.until > now);
+    if (kept.length === 0) state.blockHighlights.delete(sym);
+    else if (kept.length !== arr.length) state.blockHighlights.set(sym, kept);
   }
 }
 

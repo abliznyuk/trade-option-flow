@@ -12,15 +12,14 @@
     <label>Root <input id="root" type="text" value="SPY" size="6" /></label>
     <label>Expiry <select id="expiry"><option value="">— pick after Connect —</option></select></label>
     <label>Underlying <input id="underlying" type="text" value="SPY" size="8" placeholder="e.g. SPY" /></label>
-    <label>Strikes ± <input id="strikes-side" type="number" value="5" min="1" max="30" size="3" /></label>
-    <label>Window <input id="window-min" type="number" value="5" min="1" max="60" size="3" /> min</label>
+    <label>±<input id="strikes-side" class="num-input" type="number" value="5" min="1" max="30" title="Strikes ± around ATM" /></label>
+    <label><input id="window-min" class="num-input" type="number" value="5" min="1" max="60" title="Window, minutes" />m</label>
     <button id="go-btn" disabled>Go</button>
     <span class="sep"></span>
     <span id="status">disconnected</span>
     <span class="sep"></span>
     <span id="atm-display">ATM: —</span>
     <span class="tab-spacer"></span>
-    <span id="totals-since" class="tab-meta"></span>
     <div class="toggle" id="totals-mode-toggle" hidden>
       <button class="mode active" data-mode="premium">$</button>
       <button class="mode"        data-mode="contracts">vol</button>
@@ -28,11 +27,16 @@
     <div class="toggle" role="tablist">
       <button class="tab active" data-tab="grid" role="tab">Grid</button>
       <button class="tab"        data-tab="totals" role="tab">Totals</button>
+      <button class="tab"        data-tab="blocks" role="tab">Blocks <span id="blocks-count" class="badge">0</span></button>
     </div>
   </header>
 
   <main id="grid" class="pane"></main>
   <section id="totals" class="pane" hidden></section>
+  <section id="blocks" class="pane" hidden>
+    <div id="blocks-empty" class="blocks-empty">no multi-leg prints yet — waiting for ≥2 trades on different contracts within 50 ms, total ≥ $5k</div>
+    <div id="blocks-list"></div>
+  </section>
 
   <footer id="messages"></footer>
 
