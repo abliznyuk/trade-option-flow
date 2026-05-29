@@ -7,13 +7,9 @@
 </head>
 <body>
   <header id="toolbar">
-    <button id="mql-btn">MQL Files…</button>
-    <span class="sep"></span>
     <label>Root <input id="root" type="text" value="SPY" size="6" /></label>
     <label>Expiry <select id="expiry"><option value="">— pick after Connect —</option></select></label>
     <label>Underlying <input id="underlying" type="text" value="SPY" size="8" placeholder="e.g. SPY" /></label>
-    <label>±<input id="strikes-side" class="num-input" type="number" value="5" min="1" max="30" title="Strikes ± around ATM" /></label>
-    <label><input id="window-min" class="num-input" type="number" value="5" min="1" max="60" title="Window, minutes" />m</label>
     <button id="go-btn" disabled>Go</button>
     <span class="sep"></span>
     <span id="status">disconnected</span>
@@ -27,8 +23,13 @@
     <div class="toggle" role="tablist">
       <button class="tab active" data-tab="grid" role="tab">Grid</button>
       <button class="tab"        data-tab="totals" role="tab">Totals</button>
-      <button class="tab"        data-tab="blocks" role="tab">Blocks <span id="blocks-count" class="badge">0</span></button>
+      <button class="tab" id="blocks-tab-btn" data-tab="blocks" role="tab">Blocks <span id="blocks-count" class="badge">0</span></button>
     </div>
+    <button id="settings-btn" class="gear-btn" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+        <path fill="currentColor" d="M9.405 1.05a1.5 1.5 0 0 0-2.81 0l-.21.56a1.5 1.5 0 0 1-1.86 0.9l-.57-.19a1.5 1.5 0 0 0-1.98 1.98l.19.57a1.5 1.5 0 0 1-.9 1.86l-.56.21a1.5 1.5 0 0 0 0 2.81l.56.21a1.5 1.5 0 0 1 .9 1.86l-.19.57a1.5 1.5 0 0 0 1.98 1.98l.57-.19a1.5 1.5 0 0 1 1.86.9l.21.56a1.5 1.5 0 0 0 2.81 0l.21-.56a1.5 1.5 0 0 1 1.86-.9l.57.19a1.5 1.5 0 0 0 1.98-1.98l-.19-.57a1.5 1.5 0 0 1 .9-1.86l.56-.21a1.5 1.5 0 0 0 0-2.81l-.56-.21a1.5 1.5 0 0 1-.9-1.86l.19-.57a1.5 1.5 0 0 0-1.98-1.98l-.57.19a1.5 1.5 0 0 1-1.86-.9zM8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6"/>
+      </svg>
+    </button>
   </header>
 
   <main id="grid" class="pane"></main>
@@ -42,12 +43,43 @@
 
   <div id="modal" class="modal-overlay" hidden>
     <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-      <h3 id="modal-title">MT5 Files directory</h3>
-      <p class="hint">Path to your MetaTrader 5 terminal's <code>MQL5\Files</code> folder. The DWX EA must be running in MT5 with Algo Trading enabled.</p>
-      <input id="files-dir" type="text" placeholder="C:\Users\...\AppData\Roaming\MetaQuotes\Terminal\&lt;HASH&gt;\MQL5\Files" />
+      <h3 id="modal-title">Settings</h3>
+
+      <div class="field">
+        <label for="files-dir">MT5 Files directory</label>
+        <p class="hint">Path to your MetaTrader 5 terminal's <code>MQL5\Files</code> folder. The DWX EA must be running in MT5 with Algo Trading enabled.</p>
+        <div class="dir-picker">
+          <input id="files-dir" type="text" readonly placeholder="Click the folder icon to choose…" />
+          <button id="browse-btn" type="button" class="dir-icon" title="Browse folder" aria-label="Browse folder">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path fill="currentColor" d="M1.75 2.5A1.75 1.75 0 0 0 0 4.25v8a1.75 1.75 0 0 0 1.75 1.75h12.5A1.75 1.75 0 0 0 16 12.25V5.75A1.75 1.75 0 0 0 14.25 4H7.5L6 2.5H1.75z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="cfg-strikes-side">± Strikes around ATM</label>
+          <input id="cfg-strikes-side" type="number" min="1" max="30" value="5" />
+        </div>
+        <div class="field">
+          <label for="cfg-window-min">Window (minutes)</label>
+          <input id="cfg-window-min" type="number" min="1" max="60" value="5" />
+        </div>
+      </div>
+
+      <div class="field-row toggle-row">
+        <label for="cfg-show-blocks">Show Blocks tab</label>
+        <label class="switch">
+          <input id="cfg-show-blocks" type="checkbox" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
       <div class="modal-actions">
         <button id="modal-cancel" class="ghost">Cancel</button>
-        <button id="connect-btn">Connect</button>
+        <button id="connect-btn">Save</button>
       </div>
     </div>
   </div>

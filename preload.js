@@ -14,8 +14,12 @@ contextBridge.exposeInMainWorld('mt5', {
   unsubscribeTicksAll()   { return ipcRenderer.invoke('mt5:unsubscribe-ticks-all'); },
   pickStrikes(opts)       { return ipcRenderer.invoke('mt5:pick-strikes', opts); },
 
+  getConfig()             { return ipcRenderer.invoke('config:get'); },
+  setConfig(cfg)          { return ipcRenderer.invoke('config:set', cfg); },
+  pickFilesDir(current)   { return ipcRenderer.invoke('dialog:pick-files-dir', current); },
+
   onMessage(cb)        { ipcRenderer.on('mt5:message', (_e, p) => cb(p)); },
   onQuote(cb)          { ipcRenderer.on('mt5:quote',   (_e, p) => cb(p)); },
   onTicks(cb)          { ipcRenderer.on('mt5:ticks',   (_e, p) => cb(p)); },
-  onAutoFilesDir(cb)   { ipcRenderer.on('mt5:auto-files-dir', (_e, p) => cb(p)); },
+  onInitConfig(cb)     { ipcRenderer.on('config:init', (_e, p) => cb(p)); },
 });

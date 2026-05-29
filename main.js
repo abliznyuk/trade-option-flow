@@ -6,7 +6,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { app, BrowserWindow, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog } = require('electron');
 
 // Hide the native File/Edit/View/Window/Help menu — this is a single-purpose
 // dashboard, not a document editor, so the default menu is just visual noise.
@@ -46,12 +46,44 @@ function argFlag(name) {
 }
 
 // --- config -----------------------------------------------------------------
-// User can override via cli arg --files-dir=... or env MT5_FILES_DIR.
-function resolveFilesDir() {
+// User-level persistent settings live in userData/config.json. CLI / env can
+// still override the MQL files path for a single launch (not persisted).
+const CONFIG_DEFAULTS = {
+  filesDir: '',
+  strikesSide: 5,
+  windowMin: 5,
+  showBlocks: false,
+  totalsMode: 'premium',
+};
+let CONFIG_PATH = null;
+function getConfigPath() {
+  if (!CONFIG_PATH) CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+  return CONFIG_PATH;
+}
+function loadConfig() {
+  try {
+    const raw = fs.readFileSync(getConfigPath(), 'utf8');
+    return { ...CONFIG_DEFAULTS, ...JSON.parse(raw) };
+  } catch {
+    return { ...CONFIG_DEFAULTS };
+  }
+}
+function saveConfig(cfg) {
+  try {
+    const merged = { ...CONFIG_DEFAULTS, ...cfg };
+    fs.mkdirSync(path.dirname(getConfigPath()), { recursive: true });
+    fs.writeFileSync(getConfigPath(), JSON.stringify(merged, null, 2));
+    return merged;
+  } catch (e) {
+    console.error('config save failed', e);
+    return null;
+  }
+}
+function resolveFilesDirOverride() {
   const v = argVal('files-dir');
   if (v) return v;
   if (process.env.MT5_FILES_DIR) return process.env.MT5_FILES_DIR;
-  return null; // will be set via settings UI in renderer
+  return null;
 }
 
 // --- record / replay --------------------------------------------------------
@@ -224,6 +256,25 @@ function setupIpc() {
   ipcMain.handle('mt5:pick-strikes', async (_evt, { strikes, atm, side }) => {
     return pickStrikesAroundATM(strikes, atm, side ?? 10);
   });
+
+  ipcMain.handle('config:get', () => loadConfig());
+  ipcMain.handle('config:set', (_evt, cfg) => {
+    const merged = saveConfig(cfg);
+    return merged ? { ok: true, config: merged } : { ok: false };
+  });
+
+  ipcMain.handle('dialog:pick-files-dir', async (_evt, current) => {
+    const opts = {
+      title: 'Select MT5 MQL5\\Files folder',
+      properties: ['openDirectory'],
+    };
+    if (current && typeof current === 'string') {
+      try { if (fs.existsSync(current)) opts.defaultPath = current; } catch {}
+    }
+    const r = await dialog.showOpenDialog(win, opts);
+    if (r.canceled || !r.filePaths.length) return null;
+    return r.filePaths[0];
+  });
 }
 
 function send(channel, payload) {
@@ -251,13 +302,14 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // auto-connect if files dir came from cli / env
-  const filesDir = resolveFilesDir();
-  if (filesDir) {
-    win.webContents.once('did-finish-load', () => {
-      win.webContents.send('mt5:auto-files-dir', filesDir);
-    });
-  }
+  // Push persisted config + any CLI/env files-dir override to the renderer
+  // once the document is ready. Renderer decides what to apply / auto-connect.
+  win.webContents.once('did-finish-load', () => {
+    const cfg = loadConfig();
+    const override = resolveFilesDirOverride();
+    if (override) cfg.filesDir = override;
+    win.webContents.send('config:init', cfg);
+  });
 }
 
 app.whenReady().then(() => {
@@ -267,7 +319,7 @@ app.whenReady().then(() => {
   // In replay mode there's no real files dir — auto-trigger connect so the
   // renderer doesn't sit waiting for the user to fill the input.
   if (replay) {
-    const tryAuto = () => win && win.webContents.send('mt5:auto-files-dir', '__REPLAY__');
+    const tryAuto = () => win && win.webContents.send('config:init', { ...CONFIG_DEFAULTS, filesDir: '__REPLAY__' });
     if (win) win.webContents.once('did-finish-load', tryAuto);
   }
   app.on('activate', () => {

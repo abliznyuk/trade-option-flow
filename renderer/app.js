@@ -55,14 +55,16 @@ const $ = (id) => document.getElementById(id);
 const els = {
   filesDir: $('files-dir'),
   connect:  $('connect-btn'),
-  mqlBtn:   $('mql-btn'),
+  settingsBtn: $('settings-btn'),
   modal:    $('modal'),
   modalCancel: $('modal-cancel'),
+  browse:    $('browse-btn'),
+  cfgStrikesSide: $('cfg-strikes-side'),
+  cfgWindowMin:   $('cfg-window-min'),
+  cfgShowBlocks:  $('cfg-show-blocks'),
   root:     $('root'),
   expiry:   $('expiry'),
   underlying: $('underlying'),
-  strikesSide: $('strikes-side'),
-  windowMin: $('window-min'),
   go:       $('go-btn'),
   status:   $('status'),
   atmDisplay: $('atm-display'),
@@ -73,20 +75,69 @@ const els = {
   blocksList:  $('blocks-list'),
   blocksEmpty: $('blocks-empty'),
   blocksCount: $('blocks-count'),
-  blocksTab:   null, // set below
+  blocksTab:   $('blocks-tab-btn'),
   messages: $('messages'),
 };
 
+// ---- config ----------------------------------------------------------------
+// Persisted in main process (userData/config.json). The renderer mirrors it
+// in `cfg` and re-syncs after every change. CLI/env override of filesDir
+// arrives via the initial config:init payload but is NOT written back.
+const cfg = {
+  filesDir: '',
+  strikesSide: 5,
+  windowMin: 5,
+  showBlocks: true,
+  totalsMode: 'premium',
+};
+
+function applyCfgToUI() {
+  els.filesDir.value       = cfg.filesDir || '';
+  els.cfgStrikesSide.value = cfg.strikesSide;
+  els.cfgWindowMin.value   = cfg.windowMin;
+  els.cfgShowBlocks.checked = !!cfg.showBlocks;
+  state.totalsMode = cfg.totalsMode === 'contracts' ? 'contracts' : 'premium';
+  document.querySelectorAll('#totals-mode-toggle .mode').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === state.totalsMode);
+  });
+  applyShowBlocks();
+}
+
+function applyShowBlocks() {
+  const show = !!cfg.showBlocks;
+  els.blocksTab.hidden = !show;
+  if (!show && state.activeTab === 'blocks') {
+    document.querySelector('.toggle .tab[data-tab="grid"]').click();
+  }
+}
+
+async function persistCfg(patch) {
+  Object.assign(cfg, patch);
+  try { await window.mt5.setConfig(cfg); }
+  catch (e) { logMsg(`config save failed: ${e.message}`, 'err'); }
+}
+
 // ---- modal -----------------------------------------------------------------
 function openModal() {
+  // refresh inputs from current cfg so Cancel always reverts cleanly
+  applyCfgToUI();
   els.modal.hidden = false;
-  // focus the input on next frame so the modal is rendered
   requestAnimationFrame(() => els.filesDir.focus());
 }
 function closeModal() { els.modal.hidden = true; }
 
-els.mqlBtn.addEventListener('click', openModal);
+els.settingsBtn.addEventListener('click', openModal);
 els.modalCancel.addEventListener('click', closeModal);
+async function pickFolder() {
+  try {
+    const picked = await window.mt5.pickFilesDir(els.filesDir.value.trim());
+    if (picked) els.filesDir.value = picked;
+  } catch (e) {
+    logMsg(`folder picker failed: ${e.message}`, 'err');
+  }
+}
+els.browse.addEventListener('click', pickFolder);
+els.filesDir.addEventListener('click', pickFolder);
 
 // dismiss on backdrop click (clicks on the panel itself bubble but are not the overlay)
 els.modal.addEventListener('click', (e) => {
@@ -95,20 +146,14 @@ els.modal.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !els.modal.hidden) closeModal();
 });
-// Enter inside the input = Connect
-els.filesDir.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') els.connect.click();
-});
 
 function setFilesDirDisplay(dir) {
-  els.mqlBtn.classList.toggle('connected', !!dir && state.connected);
-  els.mqlBtn.textContent = dir ? 'MQL Files ✓' : 'MQL Files…';
-  els.mqlBtn.title = dir || '';   // full path visible on hover
+  els.settingsBtn.classList.toggle('connected', !!dir && state.connected);
+  els.settingsBtn.title = dir ? `Settings — ${dir}` : 'Settings';
 }
 
 // ---- tabs ------------------------------------------------------------------
 document.querySelectorAll('.toggle .tab').forEach(btn => {
-  if (btn.dataset.tab === 'blocks') els.blocksTab = btn;
   btn.addEventListener('click', () => {
     const tab = btn.dataset.tab;
     state.activeTab = tab;
@@ -129,6 +174,7 @@ document.querySelectorAll('#totals-mode-toggle .mode').forEach(btn => {
   btn.addEventListener('click', () => {
     state.totalsMode = btn.dataset.mode;
     document.querySelectorAll('#totals-mode-toggle .mode').forEach(b => b.classList.toggle('active', b === btn));
+    persistCfg({ totalsMode: state.totalsMode });
     renderTotals();
   });
 });
@@ -145,35 +191,61 @@ function logMsg(text, cls = 'info') {
   while (els.messages.childElementCount > 100) els.messages.removeChild(els.messages.lastChild);
 }
 
-// ---- connect ---------------------------------------------------------------
+// ---- connect / save settings ----------------------------------------------
+async function doConnect(dir) {
+  setStatus('connecting…');
+  await window.mt5.connect(dir);
+  state.connected = true;
+  setStatus('connected', 'connected');
+  setFilesDirDisplay(dir);
+  await loadExpiries();
+}
+
 els.connect.addEventListener('click', async () => {
   const dir = els.filesDir.value.trim();
-  if (!dir) { logMsg('files dir is required', 'err'); return; }
+  const strikesSide = Math.max(1, Math.min(30, parseInt(els.cfgStrikesSide.value, 10) || 5));
+  const windowMin   = Math.max(1, Math.min(60, parseInt(els.cfgWindowMin.value, 10)   || 5));
+  const showBlocks  = !!els.cfgShowBlocks.checked;
+
+  if (!dir) { logMsg('MT5 Files directory is required', 'err'); return; }
+
+  const wasConnected = state.connected;
+  const dirChanged   = dir !== cfg.filesDir;
+  const windowChanged = windowMin !== cfg.windowMin;
+  const strikesChanged = strikesSide !== cfg.strikesSide;
+
+  await persistCfg({ filesDir: dir, strikesSide, windowMin, showBlocks });
+  applyShowBlocks();
+  state.windowMs = windowMin * 60_000;
+
   try {
-    setStatus('connecting…');
-    await window.mt5.connect(dir);
-    state.connected = true;
-    setStatus('connected', 'connected');
-    setFilesDirDisplay(dir);
+    if (!wasConnected || dirChanged) {
+      await doConnect(dir);
+    } else if ((windowChanged || strikesChanged) && state.strikes.length) {
+      // live re-pull around current ATM with new params
+      await rebuildGrid();
+    }
     closeModal();
-    await loadExpiries();
   } catch (e) {
     setStatus('error', 'error');
     logMsg(`connect failed: ${e.message}`, 'err');
   }
 });
 
-window.mt5.onAutoFilesDir(async (dir) => {
-  els.filesDir.value = dir;
-  els.connect.click();
-});
-
-// Open the modal automatically on first launch if no path was pre-filled
-// from the command line / env (mt5:auto-files-dir fires shortly after load).
-window.addEventListener('DOMContentLoaded', () => {
-  setTimeout(() => {
-    if (!state.connected && !els.filesDir.value.trim()) openModal();
-  }, 150);
+window.mt5.onInitConfig(async (initial) => {
+  Object.assign(cfg, initial);
+  state.windowMs = (cfg.windowMin || 5) * 60_000;
+  applyCfgToUI();
+  if (cfg.filesDir && cfg.filesDir.trim()) {
+    try { await doConnect(cfg.filesDir.trim()); }
+    catch (e) {
+      setStatus('error', 'error');
+      logMsg(`auto-connect failed: ${e.message}`, 'err');
+      openModal();
+    }
+  } else {
+    openModal();
+  }
 });
 
 window.mt5.onMessage((msg) => {
@@ -245,7 +317,7 @@ function closestStrike(arr, target) {
 els.go.addEventListener('click', async () => {
   state.expiry = els.expiry.value;
   state.underlying = els.underlying.value.trim().toUpperCase();
-  state.windowMs = Math.max(60_000, parseInt(els.windowMin.value, 10) * 60_000);
+  state.windowMs = Math.max(60_000, (cfg.windowMin || 5) * 60_000);
 
   if (!state.expiry) { logMsg('pick an expiry first', 'err'); return; }
   if (!state.chain) { logMsg('chain not loaded yet', 'err'); return; }
@@ -281,7 +353,7 @@ async function rebuildGrid() {
   state.rebuilding = true;
   try {
     const allStrikes = state.chain.byExpiry[state.expiry].strikes;
-    const side = Math.max(1, parseInt(els.strikesSide.value, 10) || 5);
+    const side = Math.max(1, parseInt(cfg.strikesSide, 10) || 5);
     const strikes = await window.mt5.pickStrikes({ strikes: allStrikes, atm: state.atm, side });
     state.strikes = strikes;
     state.symbols = {};

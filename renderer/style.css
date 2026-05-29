@@ -113,6 +113,18 @@ header#toolbar .toggle .mode.active {
   color: #d8dee9;
 }
 header#toolbar .tab-spacer { flex: 1; min-width: 8px; }
+header#toolbar button.gear-btn {
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 4px;
+}
+header#toolbar button.gear-btn:hover { color: #d8dee9; background: #21262d; }
 header#toolbar .tab-meta {
   color: #6e7681;
   font-family: ui-monospace, monospace;
@@ -354,6 +366,70 @@ section#blocks .block.flash {
   border-radius: 3px;
   font-size: 10px;
 }
+.modal-panel .dir-picker { position: relative; display: flex; }
+.modal-panel .dir-picker input { flex: 1; min-width: 0; padding-right: 32px; cursor: pointer; }
+.modal-panel .dir-picker button.dir-icon {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: #8b949e;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.modal-panel .dir-picker button.dir-icon:hover { color: #ffd33d; background: #21262d; }
+.modal-panel .field { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.modal-panel .field > label {
+  color: #d8dee9;
+  font-size: 12px;
+  font-weight: 500;
+}
+.modal-panel .field-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.modal-panel .toggle-row {
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+}
+.modal-panel .toggle-row > label { color: #d8dee9; font-size: 12px; font-weight: 500; }
+.modal-panel .switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+.modal-panel .switch input { opacity: 0; width: 0; height: 0; }
+.modal-panel .switch .slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: #30363d;
+  border-radius: 20px;
+  transition: background 120ms ease;
+}
+.modal-panel .switch .slider::before {
+  content: '';
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  top: 3px;
+  background: #d8dee9;
+  border-radius: 50%;
+  transition: transform 120ms ease;
+}
+.modal-panel .switch input:checked + .slider { background: #238636; }
+.modal-panel .switch input:checked + .slider::before { transform: translateX(16px); }
 .modal-panel input {
   background: #0e1116;
   color: #d8dee9;
