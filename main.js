@@ -52,6 +52,8 @@ const CONFIG_DEFAULTS = {
   filesDir: '',
   strikesSide: 5,
   windowMin: 5,
+  bufferingEnabled: false,
+  bufferingMin: 5,
   showBlocks: false,
   totalsMode: 'premium',
 };

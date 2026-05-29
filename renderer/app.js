@@ -10,6 +10,8 @@ const state = {
   expiry: null,
   underlying: 'SPY',
   windowMs: 5 * 60 * 1000,
+  bufferMs: 5 * 60 * 1000,   // ≥ windowMs; when buffering disabled, equals windowMs
+  scrubAnchorT: null,         // absolute tick-clock time for the right edge; null = live
   atm: null,           // current ATM price (mid of underlying bid/ask)
   strikes: [],         // selected strikes (ascending)
   symbols: {},         // strike -> { call: 'SYM', put: 'SYM' }
@@ -45,7 +47,6 @@ const BLOCK_WINDOW_MS    = 50;   // trades within this span (broker server time)
 const BLOCK_DEBOUNCE_MS  = 80;   // wait this long after last trade before classifying
 const BLOCK_MIN_PREMIUM  = 5000; // ignore groups under $5k total premium (retail noise)
 const BLOCK_VOL_TOL      = 0.05; // ±5% volume equality for "same size" legs
-const BLOCK_HIGHLIGHT_MS = 30000; // how long a leg stays ringed in the grid
 const BLOCK_MAX_KEEP     = 500;  // cap on stored blocks
 let blockNextId = 0;
 let blockFlushTimer = null;
@@ -61,7 +62,13 @@ const els = {
   browse:    $('browse-btn'),
   cfgStrikesSide: $('cfg-strikes-side'),
   cfgWindowMin:   $('cfg-window-min'),
+  cfgBufferingEnabled: $('cfg-buffering-enabled'),
+  cfgBufferingMin:     $('cfg-buffering-min'),
   cfgShowBlocks:  $('cfg-show-blocks'),
+  scrubber:       $('scrubber'),
+  scrubberRange:  $('scrubber-range'),
+  scrubberLabel:  $('scrubber-label'),
+  scrubberLive:   $('scrubber-live'),
   root:     $('root'),
   expiry:   $('expiry'),
   underlying: $('underlying'),
@@ -87,14 +94,30 @@ const cfg = {
   filesDir: '',
   strikesSide: 5,
   windowMin: 5,
+  bufferingEnabled: false,
+  bufferingMin: 5,
   showBlocks: true,
   totalsMode: 'premium',
 };
+
+function effectiveBufferMs() {
+  const win = state.windowMs;
+  if (!cfg.bufferingEnabled) return win;
+  const b = Math.max(1, parseInt(cfg.bufferingMin, 10) || 1) * 60_000;
+  return Math.max(b, win);
+}
 
 function applyCfgToUI() {
   els.filesDir.value       = cfg.filesDir || '';
   els.cfgStrikesSide.value = cfg.strikesSide;
   els.cfgWindowMin.value   = cfg.windowMin;
+  els.cfgBufferingEnabled.checked = !!cfg.bufferingEnabled;
+  els.cfgBufferingMin.value = cfg.bufferingMin;
+  els.cfgBufferingMin.disabled = !cfg.bufferingEnabled;
+  els.cfgBufferingMin.min = cfg.windowMin;
+  if (parseInt(els.cfgBufferingMin.value, 10) < cfg.windowMin) {
+    els.cfgBufferingMin.value = cfg.windowMin;
+  }
   els.cfgShowBlocks.checked = !!cfg.showBlocks;
   state.totalsMode = cfg.totalsMode === 'contracts' ? 'contracts' : 'premium';
   document.querySelectorAll('#totals-mode-toggle .mode').forEach(b => {
@@ -102,6 +125,100 @@ function applyCfgToUI() {
   });
   applyShowBlocks();
 }
+
+// ---- scrubber --------------------------------------------------------------
+// The scrubber lets the user park the chart's right-edge anywhere in the
+// stored buffer. Internal state is `scrubAnchorT` (absolute tick-clock time)
+// so the visible slice stays fixed as new ticks arrive. Slider uses RTL so the
+// right end of the track corresponds to LIVE (most recent).
+const SCRUB_RANGE = 1000;
+let scrubDragging = false;
+
+function updateScrubberVisibility() {
+  const shouldShow = state.activeTab === 'grid'
+    && state.bufferMs > state.windowMs
+    && state.strikes.length > 0;
+  els.scrubber.hidden = !shouldShow;
+}
+
+function currentTickNow() {
+  let tickNow = 0;
+  for (const buf of state.buffers.values()) {
+    if (buf.length > 0) {
+      const last = buf[buf.length - 1].t;
+      if (last > tickNow) tickNow = last;
+    }
+  }
+  return tickNow || Date.now();
+}
+
+// Oldest tick time across all non-empty buffers — the earliest moment we have
+// any data for. The scrubber can't go further back than this.
+function oldestAvailableTick() {
+  let oldest = Infinity;
+  for (const buf of state.buffers.values()) {
+    if (buf.length > 0 && buf[0].t < oldest) oldest = buf[0].t;
+  }
+  return Number.isFinite(oldest) ? oldest : null;
+}
+
+// Max scrubber offset (ms) given current data: capped by the buffer setting
+// AND by how much actual history is loaded. Without this clamp the slider
+// would let the user park the chart in empty space.
+function scrubMaxOffset(tickNow) {
+  const settingSpan = state.bufferMs - state.windowMs;
+  const oldest = oldestAvailableTick();
+  if (oldest == null) return 0;
+  const dataSpan = Math.max(0, tickNow - oldest - state.windowMs);
+  return Math.max(0, Math.min(settingSpan, dataSpan));
+}
+
+function syncScrubberFromState(tickNow) {
+  if (els.scrubber.hidden) return;
+  if (scrubDragging) return;
+  const span = scrubMaxOffset(tickNow);
+  if (span <= 0) {
+    els.scrubberRange.value = '0';
+    els.scrubberRange.disabled = true;
+    els.scrubberLabel.textContent = 'LIVE';
+    els.scrubberLabel.classList.add('live');
+    els.scrubberLive.classList.add('live');
+    return;
+  }
+  els.scrubberRange.disabled = false;
+  const offset = state.scrubAnchorT == null ? 0 : Math.max(0, Math.min(span, tickNow - state.scrubAnchorT));
+  // re-anchor in case data dropped reduced the available span
+  if (state.scrubAnchorT != null && offset !== (tickNow - state.scrubAnchorT)) {
+    state.scrubAnchorT = tickNow - offset;
+  }
+  els.scrubberRange.value = String(Math.round((offset / span) * SCRUB_RANGE));
+  if (offset === 0) {
+    els.scrubberLabel.textContent = 'LIVE';
+    els.scrubberLabel.classList.add('live');
+    els.scrubberLive.classList.add('live');
+  } else {
+    const mins = offset / 60_000;
+    els.scrubberLabel.textContent = `-${mins >= 10 ? mins.toFixed(0) : mins.toFixed(1)} min`;
+    els.scrubberLabel.classList.remove('live');
+    els.scrubberLive.classList.remove('live');
+  }
+}
+
+els.scrubberRange.addEventListener('pointerdown', () => { scrubDragging = true; });
+window.addEventListener('pointerup',   () => { scrubDragging = false; });
+els.scrubberRange.addEventListener('input', () => {
+  const tickNow = currentTickNow();
+  const span = scrubMaxOffset(tickNow);
+  if (span <= 0) { state.scrubAnchorT = null; return; }
+  const v = parseInt(els.scrubberRange.value, 10) || 0;
+  const offset = (v / SCRUB_RANGE) * span;
+  if (offset <= 1) state.scrubAnchorT = null;
+  else state.scrubAnchorT = tickNow - offset;
+});
+els.scrubberLive.addEventListener('click', () => {
+  state.scrubAnchorT = null;
+  els.scrubberRange.value = '0';
+});
 
 function applyShowBlocks() {
   const show = !!cfg.showBlocks;
@@ -139,6 +256,15 @@ async function pickFolder() {
 els.browse.addEventListener('click', pickFolder);
 els.filesDir.addEventListener('click', pickFolder);
 
+els.cfgBufferingEnabled.addEventListener('change', () => {
+  els.cfgBufferingMin.disabled = !els.cfgBufferingEnabled.checked;
+});
+els.cfgWindowMin.addEventListener('input', () => {
+  const w = Math.max(1, parseInt(els.cfgWindowMin.value, 10) || 1);
+  els.cfgBufferingMin.min = w;
+  if (parseInt(els.cfgBufferingMin.value, 10) < w) els.cfgBufferingMin.value = w;
+});
+
 // dismiss on backdrop click (clicks on the panel itself bubble but are not the overlay)
 els.modal.addEventListener('click', (e) => {
   if (e.target === els.modal) closeModal();
@@ -166,6 +292,7 @@ document.querySelectorAll('.toggle .tab').forEach(btn => {
       state.blocksSeenAt = state.blocks.length;
       els.blocksTab.classList.remove('has-new');
     }
+    updateScrubberVisibility();
   });
 });
 
@@ -205,6 +332,9 @@ els.connect.addEventListener('click', async () => {
   const dir = els.filesDir.value.trim();
   const strikesSide = Math.max(1, Math.min(30, parseInt(els.cfgStrikesSide.value, 10) || 5));
   const windowMin   = Math.max(1, Math.min(60, parseInt(els.cfgWindowMin.value, 10)   || 5));
+  const bufferingEnabled = !!els.cfgBufferingEnabled.checked;
+  let bufferingMin = Math.max(1, Math.min(240, parseInt(els.cfgBufferingMin.value, 10) || windowMin));
+  if (bufferingMin < windowMin) bufferingMin = windowMin;
   const showBlocks  = !!els.cfgShowBlocks.checked;
 
   if (!dir) { logMsg('MT5 Files directory is required', 'err'); return; }
@@ -213,16 +343,24 @@ els.connect.addEventListener('click', async () => {
   const dirChanged   = dir !== cfg.filesDir;
   const windowChanged = windowMin !== cfg.windowMin;
   const strikesChanged = strikesSide !== cfg.strikesSide;
+  const prevBufferMs = effectiveBufferMs();
 
-  await persistCfg({ filesDir: dir, strikesSide, windowMin, showBlocks });
+  await persistCfg({ filesDir: dir, strikesSide, windowMin, bufferingEnabled, bufferingMin, showBlocks });
   applyShowBlocks();
   state.windowMs = windowMin * 60_000;
+  const newBufferMs = effectiveBufferMs();
+  state.bufferMs = newBufferMs;
+  const bufferChanged = newBufferMs !== prevBufferMs;
+  // any change to window/buffer geometry resets the scrubber to live so the
+  // grid doesn't end up parked in a region no longer in the buffer
+  if (windowChanged || bufferChanged) state.scrubAnchorT = null;
+  updateScrubberVisibility();
 
   try {
     if (!wasConnected || dirChanged) {
       await doConnect(dir);
-    } else if ((windowChanged || strikesChanged) && state.strikes.length) {
-      // live re-pull around current ATM with new params
+    } else if ((windowChanged || strikesChanged || bufferChanged) && state.strikes.length) {
+      // live re-pull around current ATM with new params (buffer change → new lookback)
       await rebuildGrid();
     }
     closeModal();
@@ -235,7 +373,9 @@ els.connect.addEventListener('click', async () => {
 window.mt5.onInitConfig(async (initial) => {
   Object.assign(cfg, initial);
   state.windowMs = (cfg.windowMin || 5) * 60_000;
+  state.bufferMs = effectiveBufferMs();
   applyCfgToUI();
+  updateScrubberVisibility();
   if (cfg.filesDir && cfg.filesDir.trim()) {
     try { await doConnect(cfg.filesDir.trim()); }
     catch (e) {
@@ -318,6 +458,7 @@ els.go.addEventListener('click', async () => {
   state.expiry = els.expiry.value;
   state.underlying = els.underlying.value.trim().toUpperCase();
   state.windowMs = Math.max(60_000, (cfg.windowMin || 5) * 60_000);
+  state.bufferMs = effectiveBufferMs();
 
   if (!state.expiry) { logMsg('pick an expiry first', 'err'); return; }
   if (!state.chain) { logMsg('chain not loaded yet', 'err'); return; }
@@ -387,6 +528,7 @@ async function rebuildGrid() {
     buildGridDOM();
     buildTotalsDOM();
     await subscribeAllTicks();
+    updateScrubberVisibility();
     startRenderLoop();
   } finally {
     state.rebuilding = false;
@@ -448,8 +590,9 @@ async function subscribeAllTicks() {
   const specs = [];
   for (const strike of state.strikes) {
     const pair = state.symbols[strike];
-    if (pair.call) specs.push({ symbol: pair.call, lookback_sec: Math.ceil(state.windowMs / 1000) });
-    if (pair.put)  specs.push({ symbol: pair.put,  lookback_sec: Math.ceil(state.windowMs / 1000) });
+    const lookback = Math.ceil(state.bufferMs / 1000);
+    if (pair.call) specs.push({ symbol: pair.call, lookback_sec: lookback });
+    if (pair.put)  specs.push({ symbol: pair.put,  lookback_sec: lookback });
   }
   try {
     await window.mt5.subscribeTicks(specs);
@@ -463,8 +606,19 @@ async function subscribeAllTicks() {
 window.mt5.onTicks(({ symbol, ticks }) => {
   const buf = state.buffers.get(symbol);
   const meta = state.symbolMeta.get(symbol);
+  // detect out-of-order arrivals: after a re-subscribe with a larger lookback,
+  // DWX dumps historical ticks that may pre-date what's already in the buffer.
+  // Pushing them as-is leaves the buffer non-monotonic in `t`, which zig-zags
+  // the chart polyline and breaks the time-based trim (which assumes the last
+  // element is the freshest).
+  let lastT = buf && buf.length ? buf[buf.length - 1].t : -Infinity;
+  let unsorted = false;
   for (const t of ticks) {
-    if (buf) buf.push(t);
+    if (buf) {
+      if (t.t < lastT) unsorted = true;
+      else lastT = t.t;
+      buf.push(t);
+    }
     // session totals: accumulate $ premium per (strike, side, direction).
     // Premium = price × volume × 100 (US equity options contract multiplier).
     // Only flagged buy/sell trades count — neutral ticks are ignored.
@@ -502,7 +656,27 @@ window.mt5.onTicks(({ symbol, ticks }) => {
   // time using the global "tick clock" (max t across buffers), so we don't depend
   // on Date.now() vs broker-server-time offset.
   if (buf) {
-    const MAX_PER_SYMBOL = 6000;
+    if (unsorted) {
+      // sort by tick time, then dedupe consecutive identical timestamps from
+      // the same side (historical re-dump overlapping live ticks).
+      buf.sort((a, b) => a.t - b.t);
+      let w = 1;
+      for (let r = 1; r < buf.length; r++) {
+        const p = buf[w - 1], c = buf[r];
+        if (c.t === p.t && c.is_trade === p.is_trade && c.p === p.p && c.v === p.v) continue;
+        buf[w++] = c;
+      }
+      buf.length = w;
+    }
+    // time-based trim using buffer window (plus 10% slack so we don't churn at
+    // the edge); keep a hard count cap as a safety net for pathological feeds.
+    if (buf.length > 0) {
+      const cutoff = buf[buf.length - 1].t - state.bufferMs * 1.1;
+      let drop = 0;
+      while (drop < buf.length && buf[drop].t < cutoff) drop++;
+      if (drop > 0) buf.splice(0, drop);
+    }
+    const MAX_PER_SYMBOL = 60000;
     if (buf.length > MAX_PER_SYMBOL) buf.splice(0, buf.length - MAX_PER_SYMBOL);
   }
 });
@@ -653,12 +827,14 @@ function onBlockDetected(block, legs) {
   state.blocks.unshift(block);
   if (state.blocks.length > BLOCK_MAX_KEEP) state.blocks.length = BLOCK_MAX_KEEP;
 
-  // schedule highlight rings on the grid for each leg
-  const until = Date.now() + BLOCK_HIGHLIGHT_MS;
+  // schedule highlight rings on the grid for each leg. Lifetime tracks the
+  // buffer window (same as the chart's visible/scrubbable history) instead of
+  // a fixed wall-clock window, so historical blocks stay highlighted as long
+  // as their ticks are still available.
   for (const leg of legs) {
     let arr = state.blockHighlights.get(leg.symbol);
     if (!arr) { arr = []; state.blockHighlights.set(leg.symbol, arr); }
-    arr.push({ tickT: leg.t, until, kind: block.kind });
+    arr.push({ tickT: leg.t, kind: block.kind });
   }
 
   els.blocksCount.textContent = String(state.blocks.length);
@@ -807,16 +983,26 @@ function startRenderLoop() {
       }
     }
     if (tickNow === 0) tickNow = Date.now();
+    // resolve the displayed right edge: live (latest tick) or scrub anchor.
+    // If the anchor has fallen out of the buffer (history dropped), snap to live.
+    let displayTMax = tickNow;
+    if (state.scrubAnchorT != null) {
+      const minAnchor = tickNow - scrubMaxOffset(tickNow);
+      if (state.scrubAnchorT < minAnchor) state.scrubAnchorT = minAnchor;
+      displayTMax = state.scrubAnchorT;
+      if (displayTMax >= tickNow) state.scrubAnchorT = null;
+    }
     // grid: render only when visible (canvas redraws are expensive)
     if (state.activeTab === 'grid') {
-      for (const [sym, chart] of state.charts) renderChart(sym, chart, tickNow);
+      for (const [sym, chart] of state.charts) renderChart(sym, chart, displayTMax);
     }
+    syncScrubberFromState(tickNow);
     // totals: DOM bars, throttle to ~4 Hz, render always so timer keeps ticking
     const now = Date.now();
     if (now - lastTotalsRenderAt >= 250) {
       lastTotalsRenderAt = now;
       renderTotals();
-      pruneBlockHighlights(now);
+      pruneBlockHighlights(tickNow);
     }
     rafHandle = requestAnimationFrame(loop);
   };
@@ -891,8 +1077,8 @@ function renderChart(symbol, { canvas, ctx, cell, side }, tickNow) {
   // --- trade bubbles ---
   const rMax = Math.min(12, h / 3);
   const rMin = 1.5;
-  const highlights = state.blockHighlights.get(symbol);
-  const now = Date.now();
+  // highlights only visible when the Blocks tab is enabled in settings
+  const highlights = cfg.showBlocks ? state.blockHighlights.get(symbol) : null;
   for (const t of buf) {
     if (t.t < tMin || t.t > tMax) continue;
     if (!t.is_trade) continue;
@@ -913,10 +1099,9 @@ function renderChart(symbol, { canvas, ctx, cell, side }, tickNow) {
     // block, draw a yellow outline around the bubble that fades as the
     // highlight window expires.
     if (highlights) {
-      const hl = highlights.find(h => h.tickT === t.t && h.until > now);
+      const hl = highlights.find(h => h.tickT === t.t);
       if (hl) {
-        const remaining = (hl.until - now) / BLOCK_HIGHLIGHT_MS;
-        ctx.strokeStyle = `rgba(255, 211, 61, ${0.4 + 0.5 * remaining})`;
+        ctx.strokeStyle = 'rgba(255, 211, 61, 0.85)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
@@ -926,9 +1111,10 @@ function renderChart(symbol, { canvas, ctx, cell, side }, tickNow) {
   }
 }
 
-function pruneBlockHighlights(now) {
+function pruneBlockHighlights(tickNow) {
+  const floor = tickNow - state.bufferMs;
   for (const [sym, arr] of state.blockHighlights) {
-    const kept = arr.filter(h => h.until > now);
+    const kept = arr.filter(h => h.tickT > floor);
     if (kept.length === 0) state.blockHighlights.delete(sym);
     else if (kept.length !== arr.length) state.blockHighlights.set(sym, kept);
   }

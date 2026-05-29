@@ -32,6 +32,11 @@
     </button>
   </header>
 
+  <div id="scrubber" class="scrubber" hidden>
+    <span class="scrubber-label" id="scrubber-label">LIVE</span>
+    <input id="scrubber-range" type="range" min="0" max="1000" step="1" value="0" dir="rtl" />
+    <button id="scrubber-live" class="scrubber-live" type="button">live</button>
+  </div>
   <main id="grid" class="pane"></main>
   <section id="totals" class="pane" hidden></section>
   <section id="blocks" class="pane" hidden>
@@ -67,6 +72,16 @@
           <label for="cfg-window-min">Window (minutes)</label>
           <input id="cfg-window-min" type="number" min="1" max="60" value="5" />
         </div>
+      </div>
+
+      <div class="field-row buffering-row">
+        <label for="cfg-buffering-enabled" class="buffering-label">Buffering window</label>
+        <label class="switch">
+          <input id="cfg-buffering-enabled" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+        <input id="cfg-buffering-min" class="buffering-min" type="number" min="1" max="240" value="5" disabled />
+        <span class="buffering-unit">min</span>
       </div>
 
       <div class="field-row toggle-row">
